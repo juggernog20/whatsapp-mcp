@@ -786,6 +786,43 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	}()
 }
 
+// backfillChatNames updates chat names from whatsmeow's contact store
+// for any chats where the name is just the phone number
+func backfillChatNames(client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger) {
+	contacts, err := client.Store.Contacts.GetAllContacts(context.Background())
+	if err != nil {
+		logger.Warnf("Failed to get contacts for backfill: %v", err)
+		return
+	}
+
+	updated := 0
+	for jid, contact := range contacts {
+		name := contact.FullName
+		if name == "" {
+			name = contact.PushName
+		}
+		if name == "" {
+			continue
+		}
+
+		chatJID := jid.String()
+		// Update the chat name only if the current name is just the phone number
+		result, err := messageStore.db.Exec(
+			"UPDATE chats SET name = ? WHERE jid = ? AND (name = ? OR name = '')",
+			name, chatJID, jid.User,
+		)
+		if err != nil {
+			continue
+		}
+		rows, _ := result.RowsAffected()
+		if rows > 0 {
+			updated++
+		}
+	}
+
+	logger.Infof("Backfilled %d chat names from contacts", updated)
+}
+
 func main() {
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
@@ -904,6 +941,9 @@ func main() {
 	}
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
+
+	// Backfill chat names from whatsmeow's contact store
+	backfillChatNames(client, messageStore, logger)
 
 	// Start REST API server
 	startRESTServer(client, messageStore, 8080)
