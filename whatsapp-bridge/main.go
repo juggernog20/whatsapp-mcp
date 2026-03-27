@@ -203,9 +203,12 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string, types.JID, whatsmeow.SendResponse) {
+	var zeroJID types.JID
+	var zeroResp whatsmeow.SendResponse
+
 	if !client.IsConnected() {
-		return false, "Not connected to WhatsApp"
+		return false, "Not connected to WhatsApp", zeroJID, zeroResp
 	}
 
 	// Create JID for recipient
@@ -219,7 +222,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Parse the JID string
 		recipientJID, err = types.ParseJID(recipient)
 		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
+			return false, fmt.Sprintf("Error parsing JID: %v", err), zeroJID, zeroResp
 		}
 	} else {
 		// Create JID from phone number
@@ -236,7 +239,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err)
+			return false, fmt.Sprintf("Error reading media file: %v", err), zeroJID, zeroResp
 		}
 
 		// Determine media type and mime type based on file extension
@@ -285,7 +288,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Upload media to WhatsApp servers
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
-			return false, fmt.Sprintf("Error uploading media: %v", err)
+			return false, fmt.Sprintf("Error uploading media: %v", err), zeroJID, zeroResp
 		}
 
 		fmt.Println("Media uploaded", resp)
@@ -315,7 +318,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 					seconds = analyzedSeconds
 					waveform = analyzedWaveform
 				} else {
-					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
+					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err), zeroJID, zeroResp
 				}
 			} else {
 				fmt.Printf("Not an Ogg Opus file: %s\n", mimeType)
@@ -362,13 +365,13 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	sendResp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
-		return false, fmt.Sprintf("Error sending message: %v", err)
+		return false, fmt.Sprintf("Error sending message: %v", err), zeroJID, zeroResp
 	}
 
-	return true, fmt.Sprintf("Message sent to %s", recipient)
+	return true, fmt.Sprintf("Message sent to %s", recipient), recipientJID, sendResp
 }
 
 // Extract media info from a message
@@ -706,8 +709,69 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message, recipientJID, sendResp := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
+
+		// Persist the outbound message to the local database
+		if success {
+			chatJID := recipientJID.String()
+			sender := ""
+			if client.Store.ID != nil {
+				sender = client.Store.ID.User
+			}
+
+			// Extract media info from sent message for storage
+			var mediaType, filename, url string
+			var mediaKey, fileSHA256, fileEncSHA256 []byte
+			var fileLength uint64
+			if req.MediaPath != "" {
+				// For media messages, store basic media info
+				fileExt := strings.ToLower(req.MediaPath[strings.LastIndex(req.MediaPath, ".")+1:])
+				switch fileExt {
+				case "jpg", "jpeg", "png", "gif", "webp":
+					mediaType = "image"
+				case "ogg":
+					mediaType = "audio"
+				case "mp4", "avi", "mov":
+					mediaType = "video"
+				default:
+					mediaType = "document"
+				}
+				filename = req.MediaPath[strings.LastIndex(req.MediaPath, "/")+1:]
+			}
+
+			// Update chat record
+			if err := messageStore.StoreChat(chatJID, chatJID, sendResp.Timestamp); err != nil {
+				fmt.Printf("Warning: failed to store chat for sent message: %v\n", err)
+			}
+
+			// Store the sent message
+			if err := messageStore.StoreMessage(
+				sendResp.ID,
+				chatJID,
+				sender,
+				req.Message,
+				sendResp.Timestamp,
+				true, // is_from_me
+				mediaType,
+				filename,
+				url,
+				mediaKey,
+				fileSHA256,
+				fileEncSHA256,
+				fileLength,
+			); err != nil {
+				fmt.Printf("Warning: failed to store sent message: %v\n", err)
+			} else {
+				timestamp := sendResp.Timestamp.Format("2006-01-02 15:04:05")
+				if mediaType != "" {
+					fmt.Printf("[%s] → %s: [%s: %s] %s (stored)\n", timestamp, chatJID, mediaType, filename, req.Message)
+				} else {
+					fmt.Printf("[%s] → %s: %s (stored)\n", timestamp, chatJID, req.Message)
+				}
+			}
+		}
+
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
 
